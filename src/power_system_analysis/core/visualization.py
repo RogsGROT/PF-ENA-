@@ -12,8 +12,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import networkx as nx
 import pandas as pd
+import andes
 from matplotlib.collections import LineCollection
 from matplotlib.colors import LinearSegmentedColormap, Normalize
+from andes.utils.paths import get_case
 
 # Add the src directory to the Python path if running directly
 if __name__ == "__main__":
@@ -24,6 +26,10 @@ if __name__ == "__main__":
 
 # Import the system setup function
 from power_system_analysis.core.step_1_system_setup import setup_ieee14_dynamic, add_battery
+
+# Define file paths at module level
+RAW_FILE = get_case('ieee14/ieee14.raw')
+DYR_FILE = get_case('ieee14/ieee14.dyr')
 
 class PowerSystemVisualizer:
     """
@@ -69,79 +75,69 @@ class PowerSystemVisualizer:
         
     def _process_system(self):
         """Process system components and build the graph."""
-        # Add all buses (nodes)
+        # Create an empty graph
+        self.graph = nx.DiGraph()
+
+        # Add nodes (buses)
         for i in range(len(self.system.Bus)):
             bus_idx = self.system.Bus.idx.v[i]
-            voltage = self.system.Bus.v.v[i]
-            angle = self.system.Bus.a.v[i]
-            vn = self.system.Bus.Vn.v[i]  # Nominal voltage (kV)
+            v = self.system.Bus.v.v[i]
+            a = self.system.Bus.a.v[i]
+            vn = self.system.Bus.Vn.v[i]
             
-            # Create node with attributes
+            # Initialize node attributes
             self.graph.add_node(
-                bus_idx, 
-                voltage=voltage, 
-                angle=angle,
+                bus_idx,
+                voltage=v,
+                angle=a,
                 vn=vn,
                 has_gen=False,
                 has_load=False,
+                type='bus',
                 gen_p=0,
                 gen_q=0,
                 load_p=0,
-                load_q=0,
-                type="bus"
+                load_q=0
             )
-        
-        # Add generators
-        # Slack generator
-        for i in range(len(self.system.Slack)):
-            gen_idx = self.system.Slack.idx.v[i]
-            bus_idx = self.system.Slack.bus.v[i]
-            p = self.system.Slack.p.v[i] * self.system.config.mva  # Convert to MW
-            q = self.system.Slack.q.v[i] * self.system.config.mva  # Convert to MVar
-            
-            # Update node attributes
-            self.graph.nodes[bus_idx]['has_gen'] = True
-            self.graph.nodes[bus_idx]['gen_p'] += p
-            self.graph.nodes[bus_idx]['gen_q'] += q
-            self.graph.nodes[bus_idx]['type'] = "slack"
-            
-        # PV generators
+
+        # Add generator information
         for i in range(len(self.system.PV)):
-            gen_idx = self.system.PV.idx.v[i]
             bus_idx = self.system.PV.bus.v[i]
-            p = self.system.PV.p.v[i] * self.system.config.mva  # Convert to MW
-            q = self.system.PV.q.v[i] * self.system.config.mva  # Convert to MVar
+            p = self.system.PV.p.v[i] * self.system.config.mva
+            q = self.system.PV.q.v[i] * self.system.config.mva
+            name = str(self.system.PV.name.v[i])  # Get generator name
             
-            # Check if this is a battery (ID > 100 based on add_battery function)
-            is_battery = gen_idx >= 100
-            
-            # Update node attributes
             self.graph.nodes[bus_idx]['has_gen'] = True
-            self.graph.nodes[bus_idx]['gen_p'] += p
-            self.graph.nodes[bus_idx]['gen_q'] += q
+            self.graph.nodes[bus_idx]['gen_p'] = p
+            self.graph.nodes[bus_idx]['gen_q'] = q
             
-            if is_battery:
-                self.graph.nodes[bus_idx]['has_battery'] = True
-                self.graph.nodes[bus_idx]['type'] = "battery"
-            elif self.graph.nodes[bus_idx]['type'] != "slack":  # Don't override slack bus type
-                self.graph.nodes[bus_idx]['type'] = "generator"
-        
-        # Add loads
+            # Check if this is a battery (name starts with 'BATT_')
+            if 'BATT_' in name:
+                self.graph.nodes[bus_idx]['type'] = 'battery'
+            else:
+                self.graph.nodes[bus_idx]['type'] = 'generator'
+
+        # Add slack bus information
+        for i in range(len(self.system.Slack)):
+            bus_idx = self.system.Slack.bus.v[i]
+            p = self.system.Slack.p.v[i] * self.system.config.mva
+            q = self.system.Slack.q.v[i] * self.system.config.mva
+            
+            self.graph.nodes[bus_idx]['has_gen'] = True
+            self.graph.nodes[bus_idx]['type'] = 'slack'
+            self.graph.nodes[bus_idx]['gen_p'] = p
+            self.graph.nodes[bus_idx]['gen_q'] = q
+
+        # Add load information
         for i in range(len(self.system.PQ)):
-            load_idx = self.system.PQ.idx.v[i]
             bus_idx = self.system.PQ.bus.v[i]
-            p = self.system.PQ.p0.v[i] * self.system.config.mva  # Convert to MW
-            q = self.system.PQ.q0.v[i] * self.system.config.mva  # Convert to MVar
+            p = self.system.PQ.p0.v[i] * self.system.config.mva
+            q = self.system.PQ.q0.v[i] * self.system.config.mva
             
-            # Update node attributes
             self.graph.nodes[bus_idx]['has_load'] = True
-            self.graph.nodes[bus_idx]['load_p'] += p
-            self.graph.nodes[bus_idx]['load_q'] += q
-            
-            # Don't override type if it's already a generator
-            if self.graph.nodes[bus_idx]['type'] == "bus":
-                self.graph.nodes[bus_idx]['type'] = "load"
-                
+            self.graph.nodes[bus_idx]['load_p'] = p
+            self.graph.nodes[bus_idx]['load_q'] = q
+
         # Add lines (edges)
         for i in range(len(self.system.Line)):
             line_idx = self.system.Line.idx.v[i]
@@ -150,72 +146,37 @@ class PowerSystemVisualizer:
             
             # Check if this is a transformer
             is_transformer = False
-            tap = 1.0
             if hasattr(self.system.Line, 'tap') and self.system.Line.tap.v[i] != 1.0:
                 is_transformer = True
-                tap = self.system.Line.tap.v[i]
             
-            # Get line parameters
-            r = self.system.Line.r.v[i]  # Resistance (pu)
-            x = self.system.Line.x.v[i]  # Reactance (pu)
-            b = self.system.Line.b.v[i]  # Susceptance (pu)
-            
-            # Get voltage and angle values
+            # Get bus voltages and angles
             v1 = self.system.Bus.v.v[self.system.Bus.idx.v.index(from_bus)]
             v2 = self.system.Bus.v.v[self.system.Bus.idx.v.index(to_bus)]
             a1 = self.system.Bus.a.v[self.system.Bus.idx.v.index(from_bus)]
             a2 = self.system.Bus.a.v[self.system.Bus.idx.v.index(to_bus)]
             
-            # Convert voltages to complex form
-            v1_complex = v1 * np.exp(1j * a1)
-            v2_complex = v2 * np.exp(1j * a2)
+            # Get line parameters
+            r = self.system.Line.r.v[i]
+            x = self.system.Line.x.v[i]
+            tap = self.system.Line.tap.v[i] if hasattr(self.system.Line, 'tap') else 1.0
             
-            # Calculate series impedance and admittance
-            z = complex(r, x)
-            y_series = 1/z if z != 0 else 0
-            y_shunt = complex(0, b/2)  # Half the total line charging susceptance at each end
+            # Calculate power flows using complex numbers
+            y = 1/(r + 1j*x)  # Line admittance
+            v1_complex = v1 * np.exp(1j * a1)  # Complex voltage at from bus
+            v2_complex = v2 * np.exp(1j * a2)  # Complex voltage at to bus
             
-            if is_transformer:
-                # For transformers:
-                # The admittance matrix for a transformer is:
-                # [y/t²   -y/t ]
-                # [-y/t    y   ]
-                # where t is the tap ratio and y is the series admittance
-                
-                # Calculate currents
-                i1 = (y_series/tap**2) * v1_complex - (y_series/tap) * v2_complex
-                i2 = -(y_series/tap) * v1_complex + y_series * v2_complex
-                
-                # Calculate complex power
-                s1 = v1_complex * np.conj(i1)
-                s2 = v2_complex * np.conj(i2)
-                
-                # Get power flows in MW and MVar - let actual power flow determine direction
-                p_from = s1.real * self.system.config.mva
-                q_from = s1.imag * self.system.config.mva
-                p_to = s2.real * self.system.config.mva
-                q_to = s2.imag * self.system.config.mva
-            else:
-                # For regular lines:
-                # Calculate currents including both series and shunt elements
-                i1 = y_series * (v1_complex - v2_complex) + y_shunt * v1_complex
-                i2 = y_series * (v2_complex - v1_complex) + y_shunt * v2_complex
-                
-                # Calculate complex power
-                s1 = v1_complex * np.conj(i1)
-                s2 = v2_complex * np.conj(i2)
-                
-                # Get power flows in MW and MVar - let actual power flow determine direction
-                p_from = s1.real * self.system.config.mva
-                q_from = s1.imag * self.system.config.mva
-                p_to = s2.real * self.system.config.mva
-                q_to = s2.imag * self.system.config.mva
+            # Calculate current and complex power flow
+            i_complex = (v1_complex/tap - v2_complex) * y
+            s_from = v1_complex/tap * np.conj(i_complex)  # Complex power from bus1 to bus2
             
-            # Calculate apparent power and loading
-            s_from = (p_from**2 + q_from**2)**0.5
-            s_to = (p_to**2 + q_to**2)**0.5
-            rating = self.system.Line.rate_a.v[i] * self.system.config.mva if hasattr(self.system.Line, 'rate_a') else 0
-            loading = (max(s_from, s_to) / rating * 100) if rating > 0 else 0
+            i_complex = (v2_complex - v1_complex/tap) * y
+            s_to = v2_complex * np.conj(i_complex)  # Complex power from bus2 to bus1
+            
+            # Convert to MW and MVar
+            p_from = s_from.real * self.system.config.mva
+            q_from = s_from.imag * self.system.config.mva
+            p_to = s_to.real * self.system.config.mva
+            q_to = s_to.imag * self.system.config.mva
             
             # Add edge with attributes
             self.graph.add_edge(
@@ -226,11 +187,7 @@ class PowerSystemVisualizer:
                 q_from=q_from,
                 p_to=p_to,
                 q_to=q_to,
-                s_from=s_from,
-                s_to=s_to,
-                loading=loading,
-                is_transformer=is_transformer,
-                tap=tap if is_transformer else 1.0
+                is_transformer=is_transformer
             )
     
     def plot(self):
@@ -249,23 +206,23 @@ class PowerSystemVisualizer:
         for node in self.graph.nodes():
             node_type = self.graph.nodes[node]['type']
             if node_type == 'slack':
-                node_colors.append('red')  # Changed from lightblue to red
+                node_colors.append('red')
                 node_sizes.append(1000)
                 node_shapes.append('s')  # square
             elif node_type == 'generator':
-                node_colors.append('lightgreen')  # Changed from lightblue to lightgreen
+                node_colors.append('lightgreen')
                 node_sizes.append(1000)
                 node_shapes.append('o')  # circle
             elif node_type == 'battery':
-                node_colors.append('yellow')  # Already correct
+                node_colors.append('yellow')
                 node_sizes.append(1000)
                 node_shapes.append('h')  # hexagon
             elif node_type == 'load':
-                node_colors.append('lightblue')  # Already correct
+                node_colors.append('lightblue')
                 node_sizes.append(800)
                 node_shapes.append('o')  # circle
             else:  # bus
-                node_colors.append('white')  # Changed from lightblue to white
+                node_colors.append('white')
                 node_sizes.append(800)
                 node_shapes.append('o')  # circle
         
@@ -308,7 +265,7 @@ class PowerSystemVisualizer:
             pos_u = pos[u]
             pos_v = pos[v]
             
-            # Calculate power flows
+            # Get power flows
             p_from = data['p_from']
             q_from = data['q_from']
             
@@ -323,11 +280,11 @@ class PowerSystemVisualizer:
             self.graph, pos,
             edge_color=edge_colors,
             width=edge_widths,
-            arrows=True,  # Enable arrows
-            arrowsize=40,  # Much larger arrows
-            arrowstyle='->',  # Explicit arrow style
-            min_source_margin=25,  # Space between arrow and source node
-            min_target_margin=25   # Space between arrow and target node
+            arrows=True,
+            arrowsize=20,
+            arrowstyle='->',
+            min_source_margin=25,
+            min_target_margin=25
         )
         
         # Draw edge labels
@@ -390,7 +347,7 @@ class PowerSystemVisualizer:
                       markersize=15, label='Load Bus', markeredgecolor='black'),
             plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
                       markersize=15, label='Bus', markeredgecolor='black'),
-            plt.Line2D([0], [0], color='red', label='Transformer'),
+            plt.Line2D([0], [0], color='orange', label='Transformer'),
             plt.Line2D([0], [0], color='black', label='Line'),
             plt.Line2D([0], [0], marker='>', color='black', label='Power Flow Direction')
         ]
@@ -695,7 +652,7 @@ def create_system_visualization(system=None, battery_buses=None, output_dir='vis
     
     Args:
         system: ANDES power system object (if None, creates a new one)
-        battery_buses: List of bus indices to add batteries to
+        battery_buses: List of bus indices and power values to add batteries to
         output_dir: Directory to save visualizations
         custom_layout: Optional dictionary mapping bus numbers to (x,y) coordinates
     
@@ -704,14 +661,23 @@ def create_system_visualization(system=None, battery_buses=None, output_dir='vis
     """
     if system is None:
         if battery_buses:
-            # Create system without setup
-            system = setup_ieee14_dynamic(setup=False)
-            # Add batteries
-            for i, bus in enumerate(battery_buses):
-                add_battery(system, bus, i)
+            # Load system without setup
+            print("\nLoading system from ieee14.raw and ieee14.dyr files...")
+            system = andes.load(RAW_FILE, addfile=DYR_FILE, setup=False)
+            
+            # Add all batteries
+            num_batteries = len(battery_buses) // 2
+            for i in range(num_batteries):
+                bus = int(battery_buses[i*2])
+                power = float(battery_buses[i*2 + 1])
+                print(f"Adding a {power} MW battery at bus {bus}...")
+                add_battery(system, bus, i, p_mw=power)
+            
             # Now do setup and run power flow
             system.setup()
             system.PFlow.run()
+            
+            print("Power flow with batteries converged successfully.")
         else:
             # Create system normally if no batteries
             system = setup_ieee14_dynamic()
@@ -746,7 +712,10 @@ def create_system_visualization(system=None, battery_buses=None, output_dir='vis
     # Create visualizer
     title = "IEEE 14-Bus Power System"
     if battery_buses:
-        title += f" with Batteries at Buses {battery_buses}"
+        # Format battery info as "Bus X (Y MW)"
+        battery_info = [f"Bus {battery_buses[i]} ({battery_buses[i+1]} MW)" 
+                       for i in range(0, len(battery_buses), 2)]
+        title += f" with Batteries at {', '.join(battery_info)}"
         
     visualizer = PowerSystemVisualizer(system, title=title, custom_layout=custom_layout)
     
@@ -761,11 +730,30 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Power System Visualization Tool')
-    parser.add_argument('--battery', type=int, nargs='+', help='Bus indices to add batteries to')
+    parser.add_argument('--battery', nargs='+', 
+                      help='Bus indices and power values to add batteries to. Format: BUS1 POWER1 BUS2 POWER2 ...')
     parser.add_argument('--output', type=str, default='visualizations', help='Output directory for visualizations')
     parser.add_argument('--system', type=str, help='Path to saved system pickle file')
     
     args = parser.parse_args()
+    
+    # Process battery arguments
+    battery_args = None
+    if args.battery:
+        if len(args.battery) % 2 != 0:
+            print("Error: Battery arguments must be in pairs (BUS POWER)")
+            sys.exit(1)
+        
+        # Convert arguments to proper types
+        battery_args = []
+        for i in range(0, len(args.battery), 2):
+            try:
+                bus = int(args.battery[i])
+                power = float(args.battery[i + 1])
+                battery_args.extend([bus, power])
+            except ValueError:
+                print(f"Error: Invalid battery argument. Bus must be an integer and power must be a number.")
+                sys.exit(1)
     
     # Check if a system file was provided
     system = None
@@ -782,7 +770,7 @@ if __name__ == "__main__":
     print("Creating power system visualizations...")
     visualizer, system = create_system_visualization(
         system=system,
-        battery_buses=args.battery,
+        battery_buses=battery_args,
         output_dir=args.output
     )
     

@@ -34,10 +34,9 @@ ENV/
 *.swo
 
 # Project specific
-*.xlsx
-*.dyr
-!data/ieee14/*.xlsx
-!data/ieee14/*.dyr
+visualizations/
+*.log
+*.pkl
 
 # Jupyter Notebook
 .ipynb_checkpoints
