@@ -20,6 +20,10 @@ wheels/
 .installed.cfg
 *.egg
 
+# Excel files
+*.xlsx
+*.xls
+
 # Virtual Environment
 .env
 .venv
@@ -72,4 +76,8 @@ coverage.xml
 .hypothesis/
 
 # Logs
-*.log 
+*.log
+ieee14_out.txt
+
+# VS Code
+.vscode/ 

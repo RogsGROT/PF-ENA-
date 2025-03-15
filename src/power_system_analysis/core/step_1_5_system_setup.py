@@ -5,12 +5,14 @@ from andes.utils.paths import get_case
 import os
 import shutil
 import argparse
+import itertools
+from tqdm import tqdm
 
 # Define file paths at module level
 RAW_FILE = get_case('ieee14/ieee14.raw')
 DYR_FILE = get_case('ieee14/ieee14.dyr')
 
-def export_system_data_to_excel(ss, filename='system_data.xlsx'):
+def export_system_data_to_excel(ss, writer, sheet_name):
     """Export power system data to Excel file with all tables in a single sheet"""
     
     # Create lists to store all rows of data
@@ -125,49 +127,24 @@ def export_system_data_to_excel(ss, filename='system_data.xlsx'):
     
     # Convert to DataFrame and save to Excel
     df = pd.DataFrame(all_rows)
+    df.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
     
-    # Try to save the file with multiple attempts
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            # Create Excel writer object
-            with pd.ExcelWriter(filename, engine='openpyxl', mode='w') as writer:
-                df.to_excel(writer, sheet_name='System Data', index=False, header=False)
-                
-                # Auto-adjust column widths
-                worksheet = writer.sheets['System Data']
-                for idx, col in enumerate(worksheet.columns, 1):
-                    max_length = 0
-                    column = [cell.value for cell in col]
-                    for cell in column:
-                        try:
-                            if len(str(cell)) > max_length:
-                                max_length = len(str(cell))
-                        except:
-                            pass
-                    adjusted_width = (max_length + 2)
-                    worksheet.column_dimensions[chr(64 + idx)].width = adjusted_width
-            
-            print(f"System data exported to {filename}")
-            break
-        except PermissionError:
-            if attempt < max_attempts - 1:
-                import time
-                time.sleep(1)  # Wait a second before retrying
-                continue
-            else:
-                print(f"Error: Could not write to {filename}. Please ensure the file is not open in another program.")
-                raise
+    # Auto-adjust column widths
+    worksheet = writer.sheets[sheet_name]
+    for idx, col in enumerate(worksheet.columns, 1):
+        max_length = 0
+        column = [cell.value for cell in col]
+        for cell in column:
+            try:
+                if len(str(cell)) > max_length:
+                    max_length = len(str(cell))
+            except:
+                pass
+        adjusted_width = (max_length + 2)
+        worksheet.column_dimensions[chr(64 + idx)].width = adjusted_width
 
-def setup_ieee14_dynamic(setup=True, export_excel=False, battery_bus=None, battery_p=None):
-    """Create and configure an IEEE 14-bus system with dynamic models
-    
-    Args:
-        setup (bool, optional): Whether to run setup after loading. Defaults to True.
-        export_excel (bool, optional): Whether to export system data to Excel. Defaults to False.
-        battery_bus (int or list, optional): Bus number(s) to add battery. Defaults to None.
-        battery_p (float or list, optional): Battery active power(s) in MW. Defaults to None.
-    """
+def setup_ieee14_dynamic(setup=True, battery_bus=None, battery_p=None):
+    """Create and configure an IEEE 14-bus system with dynamic models"""
     # Load the IEEE 14-bus system with both power flow and dynamic data
     ss = andes.load(RAW_FILE, addfile=DYR_FILE, setup=False)
     
@@ -197,38 +174,17 @@ def setup_ieee14_dynamic(setup=True, export_excel=False, battery_bus=None, batte
         
         # Add each battery
         for bus, p in zip(battery_bus, battery_p):
-            print(f"\nAdding {p} MW battery at bus {bus}...")
+            print(f"Adding {p} MW battery at bus {bus}...")
             add_battery(ss, bus, bus, p)  # Using bus number as idx
     
     if setup:
         # Setup the system
         ss.setup()
         
-        # Print transformer information for debugging
-        for i in range(len(ss.Line)):
-            if hasattr(ss.Line, 'tap') and ss.Line.tap.v[i] != 1.0:
-                from_bus = ss.Line.bus1.v[i]
-                to_bus = ss.Line.bus2.v[i]
-                
-                # Get voltage levels
-                from_vn = ss.Bus.Vn.v[ss.Bus.idx.v.index(from_bus)]
-                to_vn = ss.Bus.Vn.v[ss.Bus.idx.v.index(to_bus)]
-                
-                print(f"Transformer {ss.Line.idx.v[i]} (Bus {from_bus}-{to_bus}): {from_vn:.1f}/{to_vn:.1f} kV, ratio={ss.Line.tap.v[i]:.4f}")
-        
         # Run initial power flow
-        print("\nRunning initial power flow...")
+        print("Running power flow...")
         ss.PFlow.run()
-        print("Initial power flow converged successfully.")
-        
-        # Export to Excel if requested
-        if export_excel:
-            try:
-                export_system_data_to_excel(ss)
-                print("System data exported to system_data.xlsx")
-            except Exception as e:
-                print(f"Error: Could not write to system_data.xlsx. Please ensure the file is not open in another program.")
-                raise e
+        print("Power flow converged successfully.")
     
     return ss
 
@@ -289,17 +245,38 @@ def add_battery(ss, bus_idx, idx, p_mw=-10, q_mvar=0):
         'Vref0': 1.0,      # Voltage reference 0
     })
 
+def generate_all_configurations(mw1, mw2):
+    """Generate all possible battery configurations and export to Excel"""
+    filename = 'system_data_all_configs.xlsx'
+    print(f"Generating all configurations and exporting to {filename}")
+    
+    # Create Excel writer
+    with pd.ExcelWriter(filename, engine='openpyxl', mode='w') as writer:
+        # Base case (no batteries)
+        print("\nProcessing base case (no batteries)...")
+        ss = setup_ieee14_dynamic()
+        export_system_data_to_excel(ss, writer, 'Base')
+        
+        # Single battery configurations
+        print("\nProcessing single battery configurations...")
+        for bus in tqdm(range(1, 15)):
+            sheet_name = f"{bus:02d}"
+            ss = setup_ieee14_dynamic(battery_bus=[bus], battery_p=[mw1])
+            export_system_data_to_excel(ss, writer, sheet_name)
+        
+        # Two battery configurations
+        print("\nProcessing two battery configurations...")
+        for bus1, bus2 in tqdm(itertools.product(range(1, 15), range(1, 15))):
+            sheet_name = f"{bus1:02d}{bus2:02d}"
+            ss = setup_ieee14_dynamic(battery_bus=[bus1, bus2], battery_p=[mw1, mw2])
+            export_system_data_to_excel(ss, writer, sheet_name)
+    
+    print(f"\nAll configurations have been exported to {filename}")
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Setup IEEE 14-bus system with optional battery configuration')
-    parser.add_argument('--battery', nargs=2, metavar=('BUS', 'POWER'), type=float, help='Add a battery at specified bus with specified power in MW. Example: --battery 4 20')
-    parser.add_argument('--export-excel', action='store_true', default=True, help='Export system data to Excel (default: True)')
+    parser = argparse.ArgumentParser(description='Generate all possible battery configurations for IEEE 14-bus system')
+    parser.add_argument('--mw', nargs=2, type=float, required=True, metavar=('MW1', 'MW2'),
+                      help='Power output in MW for first and second battery')
     
     args = parser.parse_args()
-    
-    # Setup the system with battery if specified
-    if args.battery:
-        bus = int(args.battery[0])  # Convert to integer for bus number
-        power = args.battery[1]
-        ss = setup_ieee14_dynamic(battery_bus=[bus], battery_p=[power], export_excel=args.export_excel)
-    else:
-        ss = setup_ieee14_dynamic(export_excel=args.export_excel)
+    generate_all_configurations(args.mw[0], args.mw[1]) 
