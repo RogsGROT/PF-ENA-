@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+env/
 build/
 develop-eggs/
 dist/
@@ -27,7 +28,6 @@ wheels/
 # Virtual Environment
 .env
 .venv
-env/
 venv/
 ENV/
 
@@ -80,4 +80,18 @@ coverage.xml
 ieee14_out.txt
 
 # VS Code
-.vscode/ 
+.vscode/
+
+# ANDES output files
+*.lst
+*.npz
+*_out.txt
+cascade_analysis_output/
+
+# Matlab
+*.asv
+*.mat
+src/matlab/
+
+# Data files
+data/ieee14/*.raw 

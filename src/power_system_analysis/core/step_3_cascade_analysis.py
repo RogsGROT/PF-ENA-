@@ -1,483 +1,222 @@
 import andes
-import numpy as np
-import pandas as pd
 import os
-import sys
-from datetime import datetime
+import numpy as np
+import matplotlib.pyplot as plt
+from andes.utils.paths import get_case
+from IPython import get_ipython
+import pandas as pd
 
-# Import from our modular scripts
-from .step_1_system_setup import add_battery
-from .step_2_ena_output import generate_ena_output
+# Enable interactive plotting if in IPython
+ipython = get_ipython()
+if ipython is not None:
+    ipython.magic('matplotlib inline')
 
-def run_cascading_failure_analysis(ss, battery_buses=None, config_name='base'):
-    """
-    Perform cascading failure analysis on the system.
-    Tests all specified fault scenarios and evaluates system performance.
-    """
-    # Create a copy of the system to work with
-    sim_ss = ss.deepcopy()
+# Define the IEEE 14-bus case files
+RAW_FILE = get_case('ieee14/ieee14.raw')
+DYR_FILE = get_case('ieee14/ieee14.dyr')
+
+# Create a folder for output if it doesn't exist
+output_dir = 'cascade_analysis_output'
+os.makedirs(output_dir, exist_ok=True)
+
+# Define the base case output name
+out_name = os.path.join(output_dir, 'ieee14_cascade')
+
+def run_cascade_analysis():
+    """Run cascade failure analysis by adding a line trip and extracting metrics"""
+    # Load the system (without setup)
+    ss = andes.load(RAW_FILE, addfile=DYR_FILE, setup=False)
     
-    # Add batteries if specified
-    if battery_buses:
-        for i, bus in enumerate(battery_buses):
-            add_battery(sim_ss, bus, i)
+    # Add a line trip event (Line 1) at t=1.0 second
+    line_idx = 1
+    trip_time = 1.0
+    line_name = f'Line_{line_idx}'
     
-    # Run initial power flow to establish baseline
-    try:
-        sim_ss.PFlow.run()
-        
-        # Generate ENA input for nominal case
-        generate_ena_output(sim_ss, config_name)
-        
-        # Get baseline metrics
-        baseline = {
-            'bus_voltage': {bus: sim_ss.Bus.v.v[sim_ss.Bus.idx.v.index(bus)] for bus in range(1, len(sim_ss.Bus)+1)},
-            'line_loading': {line: sim_ss.Line.get(src='i', idx=line, attr='v') / sim_ss.Line.get(src='rate_a', idx=line, attr='v') * 100 
-                             for line in sim_ss.Line.idx.v if sim_ss.Line.get(src='rate_a', idx=line, attr='v') > 0},
-            'gen_output': {gen: sim_ss.StaticGen.get(src='p', idx=gen, attr='v') for gen in sim_ss.StaticGen.idx.v}
-        }
-        
-        # Initialize storage for cascade analysis results
-        cascade_results = {
-            'config': config_name,
-            'battery_buses': battery_buses if battery_buses else [],
-            'scenarios': []
-        }
-        
-        # SCENARIO 1: Load increase at each loading node
-        for load_idx in sim_ss.PQ.idx.v:
-            load_bus = sim_ss.PQ.bus.v[sim_ss.PQ.idx.v.index(load_idx)]
-            p_orig = sim_ss.PQ.p.v[sim_ss.PQ.idx.v.index(load_idx)]
-            q_orig = sim_ss.PQ.q.v[sim_ss.PQ.idx.v.index(load_idx)]
-            
-            print(f"Testing load increase at bus {load_bus} (PQ idx: {load_idx})...")
-            
-            # Create a copy for this specific scenario
-            scenario_ss = sim_ss.deepcopy()
-            
-            # Prepare scenario metrics
-            scenario_metrics = {
-                'scenario_type': 'load_increase',
-                'fault_location': f'bus_{load_bus}',
-                'load_idx': int(load_idx),
-                'severity': [],
-                'convergence': [],
-                'min_voltage': [],
-                'max_loading': [],
-                'max_freq_dev': [],
-                'failure_propagation': []
-            }
-            
-            # Test increasing severity levels
-            for increase_pct in [20, 50, 100, 150, 200]:
-                try:
-                    # Reset to original state
-                    test_ss = scenario_ss.deepcopy()
-                    
-                    # Apply load increase
-                    p_new = p_orig * (1 + increase_pct/100)
-                    q_new = q_orig * (1 + increase_pct/100)
-                    
-                    # Set up the event
-                    test_ss.add('TimerAction', {
-                        'uid': load_idx,
-                        'model': 'PQ',
-                        'enable': 1,
-                        'idx': load_idx,
-                        'time': 1.0,  # Apply at t=1s
-                        'action': {
-                            'p': p_new,
-                            'q': q_new,
-                        }
-                    })
-                    
-                    # Run the simulation
-                    test_ss.TDS.config.tf = 10.0
-                    test_ss.TDS.run()
-                    
-                    # Get key metrics
-                    voltage_data = test_ss.TDS.get_data('bus', bus=list(range(1, len(test_ss.Bus)+1)), var='v')
-                    min_voltage = voltage_data.min().min()
-                    
-                    freq_data = test_ss.TDS.get_data('bus', bus=list(range(1, len(test_ss.Bus)+1)), var='freq')
-                    max_freq_dev = abs(freq_data - 60.0).max().max()
-                    
-                    # Check for cascading failures
-                    failures = []
-                    for bus_idx in range(1, len(test_ss.Bus)+1):
-                        bus_voltage = voltage_data.loc[:, bus_idx].min()
-                        if bus_voltage < 0.90:  # Voltage collapse threshold
-                            failures.append(f"Bus_{bus_idx}_voltage_collapse")
-                    
-                    # Check generator stability
-                    if 'GENROU' in test_ss.models:
-                        gen_speed = test_ss.TDS.get_data('GENROU', var='omega')
-                        for gen_idx in test_ss.GENROU.idx.v:
-                            if abs(gen_speed.loc[:, gen_idx].max() - 1.0) > 0.02:  # More than 2% speed deviation
-                                gen_bus = test_ss.GENROU.bus.v[test_ss.GENROU.idx.v.index(gen_idx)]
-                                failures.append(f"Gen_{gen_idx}_at_Bus_{gen_bus}_unstable")
-                    
-                    # Record metrics
-                    scenario_metrics['severity'].append(increase_pct)
-                    scenario_metrics['convergence'].append(True)
-                    scenario_metrics['min_voltage'].append(float(min_voltage))
-                    scenario_metrics['max_freq_dev'].append(float(max_freq_dev))
-                    scenario_metrics['max_loading'].append(None)  # Not calculated in dynamic sim
-                    scenario_metrics['failure_propagation'].append(failures)
-                    
-                except Exception as e:
-                    print(f"  Simulation failed at {increase_pct}% increase: {str(e)}")
-                    scenario_metrics['severity'].append(increase_pct)
-                    scenario_metrics['convergence'].append(False)
-                    scenario_metrics['min_voltage'].append(None)
-                    scenario_metrics['max_freq_dev'].append(None)
-                    scenario_metrics['max_loading'].append(None)
-                    scenario_metrics['failure_propagation'].append(["simulation_diverged"])
-            
-            # Add this scenario to results
-            cascade_results['scenarios'].append(scenario_metrics)
-        
-        # SCENARIO 2: Generator outages
-        gen_buses = list(sim_ss.PV.bus.v) + list(sim_ss.Slack.bus.v)
-        for i, gen_bus in enumerate(gen_buses):
-            print(f"Testing generator outage at bus {gen_bus}...")
-            
-            # Create a copy for this specific scenario
-            scenario_ss = sim_ss.deepcopy()
-            
-            # Get the generator index
-            gen_idx = None
-            is_slack = False
-            for idx in scenario_ss.PV.idx.v:
-                bus = scenario_ss.PV.bus.v[scenario_ss.PV.idx.v.index(idx)]
-                if bus == gen_bus:
-                    gen_idx = idx
-                    break
-            
-            if gen_idx is None:
-                for idx in scenario_ss.Slack.idx.v:
-                    bus = scenario_ss.Slack.bus.v[scenario_ss.Slack.idx.v.index(idx)]
-                    if bus == gen_bus:
-                        gen_idx = idx
-                        is_slack = True
-                        break
-            
-            if gen_idx is None:
-                print(f"  No generator found at bus {gen_bus}")
-                continue
-            
-            # Prepare scenario metrics
-            scenario_metrics = {
-                'scenario_type': 'generator_outage',
-                'fault_location': f'bus_{gen_bus}',
-                'gen_idx': int(gen_idx),
-                'convergence': None,
-                'min_voltage': None,
-                'max_loading': None,
-                'max_freq_dev': None,
-                'failure_propagation': []
-            }
-            
-            try:
-                # Set up the generator trip event
-                test_ss = scenario_ss.deepcopy()
-                
-                # For a slack bus, we should convert it to a PV bus before tripping
-                if is_slack:
-                    # We can't directly trip the slack, so convert to PV and trip
-                    slack_p = test_ss.Slack.p.v[0]
-                    slack_v = test_ss.Slack.v.v[0]
-                    
-                    # Add a timer to convert slack to PV
-                    test_ss.add('TimerAction', {
-                        'uid': 1000,
-                        'model': 'Slack',
-                        'enable': 1,
-                        'idx': gen_idx,
-                        'time': 0.5,  # Apply at t=0.5s
-                        'action': {
-                            'u': 0.0,  # Disable slack
-                        }
-                    })
-                    
-                    # After slack is disabled, enable PV with same values
-                    test_ss.add('PV', {
-                        'idx': 9999,
-                        'bus': gen_bus,
-                        'p': slack_p,
-                        'v': slack_v,
-                        'u': 0,  # Initially disabled
-                    })
-                    
-                    test_ss.add('TimerAction', {
-                        'uid': 1001,
-                        'model': 'PV',
-                        'enable': 1,
-                        'idx': 9999,
-                        'time': 0.6,  # Apply at t=0.6s (just after slack disabled)
-                        'action': {
-                            'u': 1.0,  # Enable PV
-                        }
-                    })
-                    
-                    # Trip the PV gen
-                    test_ss.add('TimerAction', {
-                        'uid': 1002,
-                        'model': 'PV',
-                        'enable': 1,
-                        'idx': 9999,
-                        'time': 1.0,  # Apply at t=1.0s
-                        'action': {
-                            'u': 0.0,  # Trip generator
-                        }
-                    })
-                else:
-                    # Normal PV generator trip
-                    test_ss.add('TimerAction', {
-                        'uid': 1,
-                        'model': 'PV',
-                        'enable': 1,
-                        'idx': gen_idx,
-                        'time': 1.0,  # Apply at t=1s
-                        'action': {
-                            'u': 0.0,  # Trip generator
-                        }
-                    })
-                
-                # Run the simulation
-                test_ss.TDS.config.tf = 10.0
-                test_ss.TDS.run()
-                
-                # Get key metrics
-                voltage_data = test_ss.TDS.get_data('bus', bus=list(range(1, len(test_ss.Bus)+1)), var='v')
-                min_voltage = voltage_data.min().min()
-                
-                freq_data = test_ss.TDS.get_data('bus', bus=list(range(1, len(test_ss.Bus)+1)), var='freq')
-                max_freq_dev = abs(freq_data - 60.0).max().max()
-                
-                # Check for cascading failures
-                failures = []
-                for bus_idx in range(1, len(test_ss.Bus)+1):
-                    bus_voltage = voltage_data.loc[:, bus_idx].min()
-                    if bus_voltage < 0.90:  # Voltage collapse threshold
-                        failures.append(f"Bus_{bus_idx}_voltage_collapse")
-                
-                # Check generator stability
-                if 'GENROU' in test_ss.models:
-                    gen_speed = test_ss.TDS.get_data('GENROU', var='omega')
-                    for other_gen_idx in test_ss.GENROU.idx.v:
-                        # For non-tripped generators, check stability
-                        if (not is_slack and other_gen_idx != gen_idx) or (is_slack and other_gen_idx != 0):
-                            if abs(gen_speed.loc[:, other_gen_idx].max() - 1.0) > 0.02:
-                                other_gen_bus = test_ss.GENROU.bus.v[test_ss.GENROU.idx.v.index(other_gen_idx)]
-                                failures.append(f"Gen_{other_gen_idx}_at_Bus_{other_gen_bus}_unstable")
-                
-                # Record metrics
-                scenario_metrics['convergence'] = True
-                scenario_metrics['min_voltage'] = float(min_voltage)
-                scenario_metrics['max_freq_dev'] = float(max_freq_dev)
-                scenario_metrics['max_loading'] = None  # Not calculated in dynamic sim
-                scenario_metrics['failure_propagation'] = failures
-                
-            except Exception as e:
-                print(f"  Generator outage simulation failed: {str(e)}")
-                scenario_metrics['convergence'] = False
-                scenario_metrics['failure_propagation'] = ["simulation_diverged"]
-            
-            # Add this scenario to results
-            cascade_results['scenarios'].append(scenario_metrics)
-        
-        # SCENARIO 3: Line outages
-        for line_idx in sim_ss.Line.idx.v:
-            i = sim_ss.Line.idx.v.index(line_idx)
-            from_bus = sim_ss.Line.bus1.v[i]
-            to_bus = sim_ss.Line.bus2.v[i]
-            
-            print(f"Testing line outage for line {line_idx} ({from_bus}-{to_bus})...")
-            
-            # Create a copy for this specific scenario
-            scenario_ss = sim_ss.deepcopy()
-            
-            # Prepare scenario metrics
-            scenario_metrics = {
-                'scenario_type': 'line_outage',
-                'fault_location': f'line_{line_idx}_{from_bus}_{to_bus}',
-                'line_idx': int(line_idx),
-                'convergence': None,
-                'min_voltage': None,
-                'max_loading': None,
-                'max_freq_dev': None,
-                'failure_propagation': []
-            }
-            
-            try:
-                # Set up the line trip event
-                test_ss = scenario_ss.deepcopy()
-                
-                test_ss.add('TimerAction', {
-                    'uid': 1,
-                    'model': 'Line',
-                    'enable': 1,
-                    'idx': line_idx,
-                    'time': 1.0,  # Apply at t=1s
-                    'action': {
-                        'u': 0.0,  # Trip line
-                    }
-                })
-                
-                # Run the simulation
-                test_ss.TDS.config.tf = 10.0
-                test_ss.TDS.run()
-                
-                # Get key metrics
-                voltage_data = test_ss.TDS.get_data('bus', bus=list(range(1, len(test_ss.Bus)+1)), var='v')
-                min_voltage = voltage_data.min().min()
-                
-                freq_data = test_ss.TDS.get_data('bus', bus=list(range(1, len(test_ss.Bus)+1)), var='freq')
-                max_freq_dev = abs(freq_data - 60.0).max().max()
-                
-                # Check for cascading failures
-                failures = []
-                for bus_idx in range(1, len(test_ss.Bus)+1):
-                    bus_voltage = voltage_data.loc[:, bus_idx].min()
-                    if bus_voltage < 0.90:  # Voltage collapse threshold
-                        failures.append(f"Bus_{bus_idx}_voltage_collapse")
-                
-                # Check line loadings (if any are over threshold, add to failures)
-                # We'll check this by running a quick power flow at the end of the simulation
-                test_ss.PFlow.run()
-                for other_line_idx in test_ss.Line.idx.v:
-                    if other_line_idx != line_idx and test_ss.Line.u.v[test_ss.Line.idx.v.index(other_line_idx)] > 0:
-                        j = test_ss.Line.idx.v.index(other_line_idx)
-                        rate_a = test_ss.Line.rate_a.v[j]
-                        if rate_a > 0:
-                            i_line = test_ss.Line.get(src='i', idx=other_line_idx, attr='v')
-                            loading = i_line / rate_a * 100
-                            if loading > 100:
-                                other_from = test_ss.Line.bus1.v[j]
-                                other_to = test_ss.Line.bus2.v[j]
-                                failures.append(f"Line_{other_line_idx}_{other_from}_{other_to}_overloaded")
-                
-                # Check generator stability
-                if 'GENROU' in test_ss.models:
-                    gen_speed = test_ss.TDS.get_data('GENROU', var='omega')
-                    for gen_idx in test_ss.GENROU.idx.v:
-                        if abs(gen_speed.loc[:, gen_idx].max() - 1.0) > 0.02:
-                            gen_bus = test_ss.GENROU.bus.v[test_ss.GENROU.idx.v.index(gen_idx)]
-                            failures.append(f"Gen_{gen_idx}_at_Bus_{gen_bus}_unstable")
-                
-                # Record metrics
-                scenario_metrics['convergence'] = True
-                scenario_metrics['min_voltage'] = float(min_voltage)
-                scenario_metrics['max_freq_dev'] = float(max_freq_dev)
-                scenario_metrics['max_loading'] = None  # Not easily accessible in this context
-                scenario_metrics['failure_propagation'] = failures
-                
-            except Exception as e:
-                print(f"  Line outage simulation failed: {str(e)}")
-                scenario_metrics['convergence'] = False
-                scenario_metrics['failure_propagation'] = ["simulation_diverged"]
-            
-            # Add this scenario to results
-            cascade_results['scenarios'].append(scenario_metrics)
-        
-        # Save all results to Excel
-        excel_file = f'cascade_results_{config_name}.xlsx'
-        
-        # Convert to DataFrame and save
-        scenarios_df = pd.DataFrame()
-        for scenario in cascade_results['scenarios']:
-            if scenario['scenario_type'] == 'load_increase':
-                # Load increase scenarios have multiple severity levels
-                for i, severity in enumerate(scenario['severity']):
-                    row = {
-                        'config': config_name,
-                        'scenario_type': scenario['scenario_type'],
-                        'fault_location': scenario['fault_location'],
-                        'severity': severity,
-                        'convergence': scenario['convergence'][i] if i < len(scenario['convergence']) else None,
-                        'min_voltage': scenario['min_voltage'][i] if i < len(scenario['min_voltage']) else None,
-                        'max_freq_dev': scenario['max_freq_dev'][i] if i < len(scenario['max_freq_dev']) else None,
-                        'max_loading': scenario['max_loading'][i] if i < len(scenario['max_loading']) else None,
-                        'failure_propagation': str(scenario['failure_propagation'][i]) if i < len(scenario['failure_propagation']) else None
-                    }
-                    scenarios_df = pd.concat([scenarios_df, pd.DataFrame([row])], ignore_index=True)
-            else:
-                row = {
-                    'config': config_name,
-                    'scenario_type': scenario['scenario_type'],
-                    'fault_location': scenario['fault_location'],
-                    'severity': 100,  # Default severity for non-load increase scenarios
-                    'convergence': scenario['convergence'],
-                    'min_voltage': scenario['min_voltage'],
-                    'max_freq_dev': scenario['max_freq_dev'],
-                    'max_loading': scenario['max_loading'],
-                    'failure_propagation': str(scenario['failure_propagation'])
-                }
-                scenarios_df = pd.concat([scenarios_df, pd.DataFrame([row])], ignore_index=True)
-            
-        # Save the results
-        with pd.ExcelWriter(excel_file) as writer:
-            scenarios_df.to_excel(writer, sheet_name='Scenarios', index=False)
-            
-            # Include summary metrics
-            summary_data = {
-                'config': [config_name],
-                'battery_buses': [str(battery_buses)],
-                'total_scenarios': [len(cascade_results['scenarios'])],
-                'convergence_rate': [scenarios_df['convergence'].mean()],
-                'min_voltage_overall': [scenarios_df['min_voltage'].min()],
-                'max_freq_dev_overall': [scenarios_df['max_freq_dev'].max()],
-                'cascading_failures': [sum(1 for x in scenarios_df['failure_propagation'] if x != '[]' and x != 'None')]
-            }
-            pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
-        
-        print(f"Cascade analysis results saved to {excel_file}")
-        return cascade_results
-        
-    except Exception as e:
-        print(f"Error in cascade analysis: {str(e)}")
+    # Add the trip event
+    ss.add('Toggle', {
+        'model': 'Line',
+        'dev': line_name, 
+        't': trip_time
+    })
+    
+    # Configure simulation parameters
+    ss.config.tf = 15.0  # Simulation end time
+    
+    # Setup the system
+    ss.setup()
+    
+    # Run power flow first
+    print("Running power flow...")
+    ss.PFlow.run()
+    
+    if not ss.PFlow.converged:
+        print("Power flow did not converge. Check system parameters.")
         return None
+    
+    print("Power flow converged successfully. Running time domain simulation...")
+    
+    # Run time domain simulation
+    ss.TDS.config.tf = 15.0  # Set simulation time frame
+    ss.TDS.run()
+    
+    print("Simulation completed.")
+    
+    # Extract and analyze data from time series
+    extract_and_analyze_data(ss)
+    
+    # Generate plots using ANDES plotting
+    generate_plots(ss)
+    
+    return ss
+
+def extract_and_analyze_data(ss):
+    """Extract and analyze data from the simulation time series"""
+    print("\n=== Data Extraction and Analysis ===")
+    
+    # 1. Access the time series data
+    t = ss.dae.ts.t  # Time array
+    print(f"Simulation time range: {t[0]} to {t[-1]} seconds")
+    print(f"Number of time steps: {len(t)}")
+    
+    # 2. Extract bus voltage data (algebraic variables)
+    bus_voltages = ss.dae.ts.y[:, ss.Bus.v.a]
+    print(f"Shape of bus voltage data: {bus_voltages.shape}")
+    
+    # 3. Extract generator rotor speeds (differential variables)
+    if hasattr(ss, 'GENROU'):
+        gen_speeds = ss.dae.ts.x[:, ss.GENROU.omega.a]
+        print(f"Shape of generator speed data: {gen_speeds.shape}")
+        
+        # 4. Extract generator rotor angles (differential variables)
+        gen_angles = ss.dae.ts.x[:, ss.GENROU.delta.a]
+        print(f"Shape of generator angle data: {gen_angles.shape}")
+    
+    # Calculate key metrics
+    metrics = {}
+    
+    # Voltage stability metrics
+    min_voltage = np.min(bus_voltages)
+    min_voltage_time = t[np.argmin(np.min(bus_voltages, axis=1))]
+    max_deviation = np.max(np.abs(bus_voltages - 1.0))
+    
+    metrics['min_voltage'] = min_voltage
+    metrics['min_voltage_time'] = min_voltage_time
+    metrics['max_voltage_deviation'] = max_deviation
+    
+    # Frequency stability metrics (if GENROU model exists)
+    if hasattr(ss, 'GENROU'):
+        nominal_freq = 60  # Hz
+        freq_deviation = np.abs(gen_speeds - 1.0) * nominal_freq
+        max_freq_deviation = np.max(freq_deviation)
+        min_freq = np.min(gen_speeds) * nominal_freq
+        
+        metrics['max_frequency_deviation_hz'] = max_freq_deviation
+        metrics['frequency_nadir_hz'] = min_freq
+        metrics['frequency_nadir_time'] = t[np.argmin(np.min(gen_speeds, axis=1))]
+        
+        # Calculate maximum angle difference between any two generators
+        max_angle_diff = []
+        for i in range(len(t)):
+            angles_at_t = gen_angles[i, :]
+            max_diff = np.max(angles_at_t) - np.min(angles_at_t)
+            max_angle_diff.append(max_diff)
+        
+        max_angle_diff = np.array(max_angle_diff)
+        metrics['max_angle_separation_rad'] = np.max(max_angle_diff)
+        metrics['max_angle_separation_deg'] = np.max(max_angle_diff) * 180 / np.pi
+        metrics['max_angle_separation_time'] = t[np.argmax(max_angle_diff)]
+    
+    # Print metrics
+    print("\n=== Cascade Failure Analysis Metrics ===")
+    for key, value in metrics.items():
+        print(f"{key}: {value}")
+    
+    # Create a DataFrame for easier analysis (optional)
+    df = ss.dae.ts.unpack(df=True)
+    
+    # Save metrics to CSV
+    metrics_df = pd.DataFrame([metrics])
+    metrics_df.to_csv(os.path.join(output_dir, 'cascade_metrics.csv'), index=False)
+    print(f"Metrics saved to {os.path.join(output_dir, 'cascade_metrics.csv')}")
+    
+    return metrics
+
+def generate_plots(ss):
+    """Generate plots using ANDES plotting functions"""
+    print("\n=== Generating Plots ===")
+    
+    # Method 1: Using ANDES CLI commands
+    if ipython is not None:
+        # Plot bus voltages
+        ipython.magic(f'!andes plot {ss.files.lst} 0 --xargs "v Bus" --ylabel "Voltage (pu)" --save')
+        
+        # Plot generator speeds
+        if hasattr(ss, 'GENROU'):
+            ipython.magic(f'!andes plot {ss.files.lst} 0 --xargs "omega GENROU" --ylabel "Speed (pu)" --save')
+            
+            # Plot generator angles
+            ipython.magic(f'!andes plot {ss.files.lst} 0 --xargs "delta GENROU" --ylabel "Angle (rad)" --save')
+    else:
+        print("IPython not available for CLI commands")
+    
+    # Method 2: Direct plotting with matplotlib using extracted data
+    plt.figure(figsize=(12, 9))
+    
+    # Plot bus voltages
+    plt.subplot(2, 2, 1)
+    bus_voltages = ss.dae.ts.y[:, ss.Bus.v.a]
+    for i in range(bus_voltages.shape[1]):
+        plt.plot(ss.dae.ts.t, bus_voltages[:, i], label=f'Bus {ss.Bus.idx.v[i]}')
+    plt.title('Bus Voltages')
+    plt.ylabel('Voltage (pu)')
+    plt.xlabel('Time (s)')
+    plt.grid(True)
+    
+    # Plot generator data if GENROU exists
+    if hasattr(ss, 'GENROU'):
+        # Plot generator speeds
+        plt.subplot(2, 2, 2)
+        gen_speeds = ss.dae.ts.x[:, ss.GENROU.omega.a]
+        for i in range(gen_speeds.shape[1]):
+            plt.plot(ss.dae.ts.t, gen_speeds[:, i], label=f'Gen {ss.GENROU.idx.v[i]}')
+        plt.title('Generator Speeds')
+        plt.ylabel('Speed (pu)')
+        plt.xlabel('Time (s)')
+        plt.grid(True)
+        
+        # Plot generator angles
+        plt.subplot(2, 2, 3)
+        gen_angles = ss.dae.ts.x[:, ss.GENROU.delta.a]
+        for i in range(gen_angles.shape[1]):
+            plt.plot(ss.dae.ts.t, gen_angles[:, i], label=f'Gen {ss.GENROU.idx.v[i]}')
+        plt.title('Generator Angles')
+        plt.ylabel('Angle (rad)')
+        plt.xlabel('Time (s)')
+        plt.grid(True)
+        
+        # Plot generator electrical powers
+        plt.subplot(2, 2, 4)
+        if hasattr(ss.GENROU, 'Pe'):
+            gen_powers = ss.dae.ts.y[:, ss.GENROU.Pe.a]
+            for i in range(gen_powers.shape[1]):
+                plt.plot(ss.dae.ts.t, gen_powers[:, i], label=f'Gen {ss.GENROU.idx.v[i]}')
+            plt.title('Generator Electrical Powers')
+            plt.ylabel('Power (pu)')
+            plt.xlabel('Time (s)')
+            plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'cascade_analysis_plots.png'), dpi=300)
+    print(f"Plots saved to {os.path.join(output_dir, 'cascade_analysis_plots.png')}")
+    plt.show()
 
 if __name__ == "__main__":
-    # Check if we have a system file and configuration as input
-    if len(sys.argv) > 1:
-        system_file = sys.argv[1]
-        config_name = sys.argv[2] if len(sys.argv) > 2 else 'base'
-        battery_buses_str = sys.argv[3] if len(sys.argv) > 3 else None
-        
-        # Parse battery buses if provided
-        battery_buses = None
-        if battery_buses_str:
-            try:
-                battery_buses = [int(bus) for bus in battery_buses_str.split(',')]
-            except:
-                print("Error parsing battery buses. Format should be comma-separated integers.")
-                sys.exit(1)
-    else:
-        # Default to loading a saved system
-        if os.path.exists('ieee14_dynamic.pkl'):
-            system_file = 'ieee14_dynamic.pkl'
-            config_name = 'base'
-            battery_buses = None
-        else:
-            print("No system file provided. Please run 1_system_setup.py first or provide a system file.")
-            sys.exit(1)
+    # Run the cascade analysis
+    ss = run_cascade_analysis()
     
-    print(f"Loading system from {system_file}...")
-    try:
-        ss = andes.system.System()
-        ss = ss.load(system_file)
-        
-        # Run the cascade analysis
-        print(f"Running cascade analysis with config '{config_name}' and battery buses {battery_buses}...")
-        results = run_cascading_failure_analysis(ss, battery_buses, config_name)
-        
-        if results:
-            print("Analysis completed successfully!")
-        else:
-            print("Analysis failed.")
-            sys.exit(1)
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        sys.exit(1)
+    # If you already have a System object, you can extract and analyze data
+    if ss is not None:
+        print("\nCascade analysis completed successfully. Review the metrics and plots.")
+        print(f"Output files are available in the '{output_dir}' directory.")
+    else:
+        print("Cascade analysis failed. Check error messages above.")
