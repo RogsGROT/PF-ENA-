@@ -84,11 +84,16 @@ def export_system_data_to_excel(ss, filename='system_data.xlsx'):
     all_rows.append(['Bus', 'P(MW)', 'Q(MVar)'])
     for i in range(len(ss.PQ)):
         bus_idx = ss.PQ.bus.v[i]
-        all_rows.append([
-            bus_idx,
-            ss.PQ.p0.v[i] * ss.config.mva,
-            ss.PQ.q0.v[i] * ss.config.mva
-        ])
+        name = ss.PQ.name.v[i] if hasattr(ss.PQ, 'name') and i < len(ss.PQ.name.v) else ''
+        is_battery = "BATT" in name if name else False
+        
+        # Only include non-battery loads in the load table
+        if not is_battery:
+            all_rows.append([
+                bus_idx,
+                ss.PQ.p0.v[i] * ss.config.mva,
+                ss.PQ.q0.v[i] * ss.config.mva
+            ])
     
     # Add spacing
     all_rows.append([])
@@ -100,8 +105,8 @@ def export_system_data_to_excel(ss, filename='system_data.xlsx'):
     # PV generators
     for i in range(len(ss.PV)):
         bus_idx = ss.PV.bus.v[i]
-        name = str(ss.PV.name.v[i])
-        is_battery = "Yes" if "BATT" in name else "No"
+        name = str(ss.PV.name.v[i]) if hasattr(ss.PV, 'name') and i < len(ss.PV.name.v) else ''
+        is_battery = "BATT" in name if name else "No"
         gen_type = "Battery" if "BATT" in name else "PV"
         all_rows.append([
             bus_idx,
@@ -122,6 +127,23 @@ def export_system_data_to_excel(ss, filename='system_data.xlsx'):
             ss.Slack.v0.v[i],
             "No"
         ])
+    
+    # Add battery generators (from PQ model)
+    for i in range(len(ss.PQ)):
+        bus_idx = ss.PQ.bus.v[i]
+        name = ss.PQ.name.v[i] if hasattr(ss.PQ, 'name') and i < len(ss.PQ.name.v) else ''
+        is_battery = "BATT" in name if name else False
+        
+        # Include batteries in the generator table with negated power values
+        if is_battery:
+            all_rows.append([
+                bus_idx,
+                'Battery',
+                -ss.PQ.p0.v[i] * ss.config.mva,  # Negate to show as generation
+                -ss.PQ.q0.v[i] * ss.config.mva,  # Negate to show as generation
+                ss.Bus.v.v[ss.Bus.idx.v.index(bus_idx)],  # Use the actual bus voltage
+                "Yes"
+            ])
     
     # Convert to DataFrame and save to Excel
     df = pd.DataFrame(all_rows)
@@ -232,61 +254,29 @@ def setup_ieee14_dynamic(setup=True, export_excel=False, battery_bus=None, batte
     
     return ss
 
-def add_battery(ss, bus_idx, idx, p_mw=-10, q_mvar=0):
-    """Add a battery with REGCA1 generator and REECA1 controller"""
-    # Get the voltage base of the connection bus
-    bus_vn = ss.Bus.Vn.v[ss.Bus.idx.v.index(bus_idx)]
+def add_battery(ss, bus_idx, idx, p_mw=40, q_mvar=0):
+    """Add a battery as a PQ element representing its power injection.
     
-    # First add PV generator to represent the battery's power injection
-    ss.add('PV', {
+    The battery is modeled as a PQ injection. For generation (discharge), we use a negative
+    p_mw value in the PQ model since PQ is conventionally a load model.
+    
+    Args:
+        ss: ANDES system
+        bus_idx: Bus number to connect the battery
+        idx: Unique identifier for the battery
+        p_mw: Power output in MW (positive means generation/discharge)
+        q_mvar: Reactive power in MVar
+    """
+    # For PQ model, generation is negative (injecting power into the system)
+    # So we need to negate the p_mw value if it's positive (generation)
+    pq_value = -p_mw / ss.config.mva  # Negate for PQ model (negative = generation)
+    
+    ss.add('PQ', {
         'bus': bus_idx,
-        'name': f'BATT_{bus_idx}',
+        'name': f'BATT_{bus_idx}_{idx}',
         'idx': 100 + idx,
-        'Sn': 100.0,  # MVA rating
-        'Vn': bus_vn,  # kV rating (matches connection bus voltage)
-        'v0': 1.0,    # Initial voltage setpoint
-        'p0': p_mw / ss.config.mva,   # Convert MW to per-unit
-        'qmax': 50,   # Maximum reactive power
-        'qmin': -50,  # Minimum reactive power
-        'pmax': 50,   # Maximum active power
-        'pmin': -50,  # Minimum active power
-        'ra': 0.0,    # Armature resistance
-        'xs': 0.1,    # Synchronous reactance
-    })
-    
-    # Add renewable generator (REGCA1)
-    ss.add('REGCA1', {
-        'idx': 100 + idx,
-        'bus': bus_idx,
-        'gen': 100 + idx,
-        'Sn': 100.0,  # MVA rating
-        'Tg': 0.02,   # Converter time constant
-        'Rrpwr': 10,  # Power ramp rate limit
-        'Brkpt': 0.9, # Breakpoint for low voltage active current management
-        'Zerox': 0.4, # Zero crossing voltage
-        'Lvpl1': 1.0, # Voltage for LVPL gain of 1.0
-    })
-    
-    # Add renewable exciter control (REECA1)
-    ss.add('REECA1', {
-        'reg': 100 + idx,  # ID of the generator to control
-        'gen': 100 + idx,  # Generator index
-        'busr': bus_idx,   # Bus to regulate
-        'PFLAG': 0,        # P speed-dependency flag
-        'PFFLAG': 0,       # Power factor flag
-        'VFLAG': 0,        # Voltage control flag
-        'QFLAG': 0,        # Q control flag
-        'PQFLAG': 0,       # P/Q priority flag
-        'Vdip': 0.9,       # Low voltage threshold
-        'Vup': 1.1,        # High voltage threshold
-        'Trv': 0.02,       # Voltage measurement filter time constant
-        'dbd1': -0.01,     # Deadband for voltage error (lower)
-        'dbd2': 0.01,      # Deadband for voltage error (upper)
-        'Kqv': 2,          # Reactive power control gain
-        'Tp': 0.02,        # Active power filter time constant
-        'Tiq': 0.02,       # Reactive power filter time constant
-        'Vref1': 1.0,      # Voltage reference 1
-        'Vref0': 1.0,      # Voltage reference 0
+        'p0': pq_value,   # Negative value for generation in PQ model
+        'q0': -q_mvar / ss.config.mva,  # Negate reactive power as well for consistency
     })
 
 if __name__ == "__main__":
