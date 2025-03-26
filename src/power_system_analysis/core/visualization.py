@@ -68,7 +68,7 @@ class PowerSystemVisualizer:
         }
         
         # Initialize the graph
-        self.graph = nx.Graph()
+        self.graph = nx.DiGraph()
         
         # Process system components
         self._process_system()
@@ -100,22 +100,17 @@ class PowerSystemVisualizer:
                 load_q=0
             )
 
-        # Add generator information
+        # Add generator information - use p0 instead of p to match setup_ieee14_dynamic
         for i in range(len(self.system.PV)):
             bus_idx = self.system.PV.bus.v[i]
-            p = self.system.PV.p.v[i] * self.system.config.mva
+            p = self.system.PV.p0.v[i] * self.system.config.mva  # Use p0 instead of p
             q = self.system.PV.q.v[i] * self.system.config.mva
-            name = str(self.system.PV.name.v[i])  # Get generator name
+            name = str(self.system.PV.name.v[i]) if hasattr(self.system.PV, 'name') and i < len(self.system.PV.name.v) else ''
             
             self.graph.nodes[bus_idx]['has_gen'] = True
             self.graph.nodes[bus_idx]['gen_p'] = p
             self.graph.nodes[bus_idx]['gen_q'] = q
-            
-            # Check if this is a battery (name starts with 'BATT_')
-            if 'BATT_' in name:
-                self.graph.nodes[bus_idx]['type'] = 'battery'
-            else:
-                self.graph.nodes[bus_idx]['type'] = 'generator'
+            self.graph.nodes[bus_idx]['type'] = 'generator'
 
         # Add slack bus information
         for i in range(len(self.system.Slack)):
@@ -128,17 +123,28 @@ class PowerSystemVisualizer:
             self.graph.nodes[bus_idx]['gen_p'] = p
             self.graph.nodes[bus_idx]['gen_q'] = q
 
-        # Add load information
+        # Process PQ elements (loads and batteries)
         for i in range(len(self.system.PQ)):
             bus_idx = self.system.PQ.bus.v[i]
             p = self.system.PQ.p0.v[i] * self.system.config.mva
             q = self.system.PQ.q0.v[i] * self.system.config.mva
+            name = str(self.system.PQ.name.v[i]) if hasattr(self.system.PQ, 'name') and i < len(self.system.PQ.name.v) else ''
             
-            self.graph.nodes[bus_idx]['has_load'] = True
-            self.graph.nodes[bus_idx]['load_p'] = p
-            self.graph.nodes[bus_idx]['load_q'] = q
+            if 'BATT_' in name:
+                # This is a battery - add it as a generator
+                # Note: p and q are already negative in the PQ model for generation
+                # We need to negate them to show as positive generation
+                self.graph.nodes[bus_idx]['has_gen'] = True
+                self.graph.nodes[bus_idx]['gen_p'] = -p  # Negate to show as positive generation
+                self.graph.nodes[bus_idx]['gen_q'] = -q  # Negate to show as positive generation
+                self.graph.nodes[bus_idx]['type'] = 'battery'
+            else:
+                # This is a regular load
+                self.graph.nodes[bus_idx]['has_load'] = True
+                self.graph.nodes[bus_idx]['load_p'] = p
+                self.graph.nodes[bus_idx]['load_q'] = q
 
-        # Add lines (edges)
+        # Add lines (edges) - match step_1_system_setup.py calculations
         for i in range(len(self.system.Line)):
             line_idx = self.system.Line.idx.v[i]
             from_bus = self.system.Line.bus1.v[i]
@@ -149,6 +155,9 @@ class PowerSystemVisualizer:
             if hasattr(self.system.Line, 'tap') and self.system.Line.tap.v[i] != 1.0:
                 is_transformer = True
             
+            # Get tap ratio
+            tap = self.system.Line.tap.v[i] if hasattr(self.system.Line, 'tap') else 1.0
+            
             # Get bus voltages and angles
             v1 = self.system.Bus.v.v[self.system.Bus.idx.v.index(from_bus)]
             v2 = self.system.Bus.v.v[self.system.Bus.idx.v.index(to_bus)]
@@ -158,19 +167,19 @@ class PowerSystemVisualizer:
             # Get line parameters
             r = self.system.Line.r.v[i]
             x = self.system.Line.x.v[i]
-            tap = self.system.Line.tap.v[i] if hasattr(self.system.Line, 'tap') else 1.0
             
-            # Calculate power flows using complex numbers
+            # Calculate power flows using complex numbers - identical to step_1_system_setup.py
             y = 1/(r + 1j*x)  # Line admittance
             v1_complex = v1 * np.exp(1j * a1)  # Complex voltage at from bus
             v2_complex = v2 * np.exp(1j * a2)  # Complex voltage at to bus
             
-            # Calculate current and complex power flow
+            # Calculate current and complex power flow from bus1 to bus2
             i_complex = (v1_complex/tap - v2_complex) * y
-            s_from = v1_complex/tap * np.conj(i_complex)  # Complex power from bus1 to bus2
+            s_from = v1_complex/tap * np.conj(i_complex)
             
-            i_complex = (v2_complex - v1_complex/tap) * y
-            s_to = v2_complex * np.conj(i_complex)  # Complex power from bus2 to bus1
+            # Calculate current and power at "to" end
+            i_complex_to = (v2_complex - v1_complex/tap) * y  # Current in opposite direction
+            s_to = v2_complex * np.conj(i_complex_to)
             
             # Convert to MW and MVar
             p_from = s_from.real * self.system.config.mva
@@ -516,11 +525,11 @@ class PowerSystemVisualizer:
         ax3.axis('tight')
         ax3.axis('off')
         
-        # First table: Generator outputs
+        # First table: Generator outputs - match format from Excel
         gen_data = []
         gen_columns = ['Bus', 'Type', 'P (MW)', 'Q (MVar)']
         
-        # Add generator data
+        # Add generator data in sorted order
         for node in sorted(self.graph.nodes()):
             if self.graph.nodes[node]['has_gen']:
                 node_type = self.graph.nodes[node]['type']
@@ -528,7 +537,7 @@ class PowerSystemVisualizer:
                 q = self.graph.nodes[node]['gen_q']
                 
                 gen_data.append([
-                    f"Bus {node}",
+                    f"{node}",
                     node_type.capitalize(),
                     f"{p:.2f}",
                     f"{q:.2f}"
@@ -548,18 +557,18 @@ class PowerSystemVisualizer:
         gen_table.set_fontsize(9)
         gen_table.scale(1.2, 1.5)
         
-        # Second table: Load demands
+        # Second table: Load demands - match format from Excel
         load_data = []
         load_columns = ['Bus', 'P (MW)', 'Q (MVar)']
         
-        # Add load data
+        # Add load data in sorted order
         for node in sorted(self.graph.nodes()):
             if self.graph.nodes[node]['has_load']:
                 p = self.graph.nodes[node]['load_p']
                 q = self.graph.nodes[node]['load_q']
                 
                 load_data.append([
-                    f"Bus {node}",
+                    f"{node}",
                     f"{p:.2f}",
                     f"{q:.2f}"
                 ])
@@ -578,11 +587,12 @@ class PowerSystemVisualizer:
         load_table.set_fontsize(9)
         load_table.scale(1.2, 1.5)
         
-        # Third table: Line flows
+        # Third table: Line flows - match format from Excel
         line_data = []
-        line_columns = ['From Bus', 'To Bus', 'P From→To (MW)', 'Q From→To (MVar)', 'P To←From (MW)', 'Q To←From (MVar)', 'Type']
+        line_columns = ['From Bus', 'To Bus', 'P From→To (MW)', 'Q From→To (MVar)', 
+                        'P To←From (MW)', 'Q To←From (MVar)', 'Type']
         
-        # Add line data
+        # Add line data in sorted order
         edges = sorted(self.graph.edges(data=True), key=lambda x: (x[0], x[1]))
         for u, v, data_dict in edges:
             p_from = data_dict['p_from']
@@ -591,8 +601,8 @@ class PowerSystemVisualizer:
             q_to = data_dict['q_to']
             
             line_data.append([
-                f"Bus {u}",
-                f"Bus {v}",
+                f"{u}",
+                f"{v}",
                 f"{p_from:.2f}",
                 f"{q_from:.2f}",
                 f"{p_to:.2f}",
@@ -661,65 +671,47 @@ def create_system_visualization(system=None, battery_buses=None, output_dir='vis
     """
     if system is None:
         if battery_buses:
-            # Load system without setup
-            print("\nLoading system from ieee14.raw and ieee14.dyr files...")
-            system = andes.load(RAW_FILE, addfile=DYR_FILE, setup=False)
-            
-            # Add all batteries
+            # Use setup_ieee14_dynamic so that battery cases are handled exactly as in step 1
+            battery_list = []
+            battery_p_list = []
             num_batteries = len(battery_buses) // 2
             for i in range(num_batteries):
                 bus = int(battery_buses[i*2])
                 power = float(battery_buses[i*2 + 1])
                 print(f"Adding a {power} MW battery at bus {bus}...")
-                add_battery(system, bus, i, p_mw=power)
-            
-            # Now do setup and run power flow
-            system.setup()
-            system.PFlow.run()
-            
-            print("Power flow with batteries converged successfully.")
+                battery_list.append(bus)
+                battery_p_list.append(power)
+            system = setup_ieee14_dynamic(battery_bus=battery_list, battery_p=battery_p_list, export_excel=False)
         else:
-            # Create system normally if no batteries
             system = setup_ieee14_dynamic()
     
-    # Define grid-based layout
+    # Define grid-based layout if none is provided
     if custom_layout is None:
-        # Create layout based on the exact matrix coordinates
-        # where (x,y) corresponds to column and row in the grid
         grid_layout = {
-            12: (1, 0),     # Row 0
+            12: (1, 0),
             13: (4, 0),
             14: (6, 0),
-            
-            11: (3, 3),     # Row 3
+            11: (3, 3),
             10: (5, 3),
-            9: (8, 3),      # Rightmost position
-            
-            6: (0, 4),      # Row 4, leftmost position
-            
-            5: (2, 6),      # Row 5
-            8: (4, 5),      # Between Bus 5 and Bus 6
-            7: (6, 5),      # Between Bus 5 and Bus 6
-            
-            1: (0, 8),      # Row 8
-            4: (8, 8),      # Rightmost position
-            
-            2: (2, 10),     # Row 10
-            3: (5, 10)      # Between 2 and 4
+            9: (8, 3),
+            6: (0, 4),
+            5: (2, 6),
+            8: (4, 5),
+            7: (6, 5),
+            1: (0, 8),
+            4: (8, 8),
+            2: (2, 10),
+            3: (5, 10)
         }
         custom_layout = grid_layout
     
-    # Create visualizer
     title = "IEEE 14-Bus Power System"
     if battery_buses:
-        # Format battery info as "Bus X (Y MW)"
         battery_info = [f"Bus {battery_buses[i]} ({battery_buses[i+1]} MW)" 
-                       for i in range(0, len(battery_buses), 2)]
+                        for i in range(0, len(battery_buses), 2)]
         title += f" with Batteries at {', '.join(battery_info)}"
-        
-    visualizer = PowerSystemVisualizer(system, title=title, custom_layout=custom_layout)
     
-    # Save visualizations
+    visualizer = PowerSystemVisualizer(system, title=title, custom_layout=custom_layout)
     visualizer.save_visualizations(output_dir)
     
     return visualizer, system
