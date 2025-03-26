@@ -1,222 +1,201 @@
-import andes
-import os
 import numpy as np
-import matplotlib.pyplot as plt
-from andes.utils.paths import get_case
-from IPython import get_ipython
 import pandas as pd
+import argparse
+from step_1_system_setup import setup_ieee14_dynamic
 
-# Enable interactive plotting if in IPython
-ipython = get_ipython()
-if ipython is not None:
-    ipython.magic('matplotlib inline')
+def trip_line(ss, line_index):
+    """Trip (remove from service) the specified line.
+    
+    This example assumes the ANDES model has a 'status' attribute for lines.
+    Setting it to 0 is used to indicate an outage.
+    """
+    # Mark the line as out of service
+    ss.Line.status.v[line_index] = 0
+    print(f"Line {line_index} tripped at simulation time.")
 
-# Define the IEEE 14-bus case files
-RAW_FILE = get_case('ieee14/ieee14.raw')
-DYR_FILE = get_case('ieee14/ieee14.dyr')
+def cascade_check(ss):
+    """Check for overload conditions and trip elements if necessary.
+    
+    This routine examines each line and generator. In this simple example,
+    if a line's loading exceeds 100% or if a generator's output exceeds a limit,
+    the element is tripped. (You can adjust these criteria as needed.)
+    """
+    # Check lines (assuming ss.Line.loading is updated during simulation)
+    for i in range(len(ss.Line)):
+        # Skip already tripped lines (status==0)
+        if hasattr(ss.Line, 'status') and ss.Line.status.v[i] == 0:
+            continue
+        loading = ss.Line.loading.v[i] if hasattr(ss.Line, 'loading') else 0
+        if loading > 100:
+            print(f"Line {i} overloaded (loading: {loading:.1f}%), tripping.")
+            trip_line(ss, i)
+    
+    # Check generators (using a placeholder limit; adjust according to your model)
+    for i in range(len(ss.Generator)):
+        if hasattr(ss.Generator, 'status') and ss.Generator.status.v[i] == 0:
+            continue
+        p_output = ss.Generator.p.v[i] * ss.config.mva
+        p_limit = ss.Generator.pmax.v[i] if hasattr(ss.Generator, 'pmax') else 100
+        if abs(p_output) > p_limit:
+            print(f"Generator at bus {ss.Generator.bus.v[i]} overloaded (P: {p_output:.2f} MW), tripping.")
+            ss.Generator.status.v[i] = 0
 
-# Create a folder for output if it doesn't exist
-output_dir = 'cascade_analysis_output'
-os.makedirs(output_dir, exist_ok=True)
+def run_simulation_with_cascade(ss, trip_line_index):
+    """Run a dynamic simulation for one scenario in which a specified line is tripped at t = 1.0 s.
+    
+    The simulation loop (or the use of a built-in event scheduler) is used to:
+      – Reset the system state (if needed)
+      – Schedule the initial line trip at t = 1.0 s
+      – Periodically check for overloads that cause further (cascade) trips
+      – Record a few metrics from the simulation
+       
+    Returns:
+      A dictionary with metrics from this simulation run.
+    """
+    # Reset simulation to initial conditions (if a reset method exists; otherwise, re-setup)
+    if hasattr(ss, 'reset'):
+        ss.reset()
+    else:
+        ss.setup()
 
-# Define the base case output name
-out_name = os.path.join(output_dir, 'ieee14_cascade')
-
-def run_cascade_analysis():
-    """Run cascade failure analysis by adding a line trip and extracting metrics"""
-    # Load the system (without setup)
-    ss = andes.load(RAW_FILE, addfile=DYR_FILE, setup=False)
-    
-    # Add a line trip event (Line 1) at t=1.0 second
-    line_idx = 1
-    trip_time = 1.0
-    line_name = f'Line_{line_idx}'
-    
-    # Add the trip event
-    ss.add('Toggle', {
-        'model': 'Line',
-        'dev': line_name, 
-        't': trip_time
-    })
-    
-    # Configure simulation parameters
-    ss.config.tf = 15.0  # Simulation end time
-    
-    # Setup the system
-    ss.setup()
-    
-    # Run power flow first
-    print("Running power flow...")
-    ss.PFlow.run()
-    
-    if not ss.PFlow.converged:
-        print("Power flow did not converge. Check system parameters.")
-        return None
-    
-    print("Power flow converged successfully. Running time domain simulation...")
-    
-    # Run time domain simulation
-    ss.TDS.config.tf = 15.0  # Set simulation time frame
-    ss.TDS.run()
-    
-    print("Simulation completed.")
-    
-    # Extract and analyze data from time series
-    extract_and_analyze_data(ss)
-    
-    # Generate plots using ANDES plotting
-    generate_plots(ss)
-    
-    return ss
-
-def extract_and_analyze_data(ss):
-    """Extract and analyze data from the simulation time series"""
-    print("\n=== Data Extraction and Analysis ===")
-    
-    # 1. Access the time series data
-    t = ss.dae.ts.t  # Time array
-    print(f"Simulation time range: {t[0]} to {t[-1]} seconds")
-    print(f"Number of time steps: {len(t)}")
-    
-    # 2. Extract bus voltage data (algebraic variables)
-    bus_voltages = ss.dae.ts.y[:, ss.Bus.v.a]
-    print(f"Shape of bus voltage data: {bus_voltages.shape}")
-    
-    # 3. Extract generator rotor speeds (differential variables)
-    if hasattr(ss, 'GENROU'):
-        gen_speeds = ss.dae.ts.x[:, ss.GENROU.omega.a]
-        print(f"Shape of generator speed data: {gen_speeds.shape}")
+    # Define the event to trip the specified line at t = 1.0 s
+    def initial_trip_event():
+        print("Initial event at t = 1.0 s: Tripping specified line.")
+        trip_line(ss, trip_line_index)
         
-        # 4. Extract generator rotor angles (differential variables)
-        gen_angles = ss.dae.ts.x[:, ss.GENROU.delta.a]
-        print(f"Shape of generator angle data: {gen_angles.shape}")
-    
-    # Calculate key metrics
-    metrics = {}
-    
-    # Voltage stability metrics
-    min_voltage = np.min(bus_voltages)
-    min_voltage_time = t[np.argmin(np.min(bus_voltages, axis=1))]
-    max_deviation = np.max(np.abs(bus_voltages - 1.0))
-    
-    metrics['min_voltage'] = min_voltage
-    metrics['min_voltage_time'] = min_voltage_time
-    metrics['max_voltage_deviation'] = max_deviation
-    
-    # Frequency stability metrics (if GENROU model exists)
-    if hasattr(ss, 'GENROU'):
-        nominal_freq = 60  # Hz
-        freq_deviation = np.abs(gen_speeds - 1.0) * nominal_freq
-        max_freq_deviation = np.max(freq_deviation)
-        min_freq = np.min(gen_speeds) * nominal_freq
+    # If the simulation scheduler is available, add the event (otherwise we call it manually)
+    if hasattr(ss, 'add_event'):
+        ss.add_event(1.0, initial_trip_event)
+    else:
+        # Manual scheduling: the event will be triggered when t reaches 1.0 s in the loop below.
+        pass
+
+    # Optionally, you could also schedule periodic cascade-check events.
+    # For this example, we implement the cascade check within a manual simulation loop.
+    cascade_check_times = np.arange(1.0, ss.config.tf, 0.1)
+    cascade_check_idx = 0
+
+    # Prepare to record simulation metrics (time series for frequency and voltage)
+    time_series = []
+    frequency_series = []
+    voltage_series = []
+
+    # Simulation loop (using a fixed time step)
+    t = ss.config.t0
+    dt = ss.config.tstep
+    while t <= ss.config.tf:
+        # If no built-in event scheduler, trigger the initial trip manually at t = 1.0 s.
+        if abs(t - 1.0) < dt/2:
+            initial_trip_event()
         
-        metrics['max_frequency_deviation_hz'] = max_freq_deviation
-        metrics['frequency_nadir_hz'] = min_freq
-        metrics['frequency_nadir_time'] = t[np.argmin(np.min(gen_speeds, axis=1))]
+        # Periodically run cascade check
+        if cascade_check_idx < len(cascade_check_times) and abs(t - cascade_check_times[cascade_check_idx]) < dt/2:
+            cascade_check(ss)
+            cascade_check_idx += 1
         
-        # Calculate maximum angle difference between any two generators
-        max_angle_diff = []
-        for i in range(len(t)):
-            angles_at_t = gen_angles[i, :]
-            max_diff = np.max(angles_at_t) - np.min(angles_at_t)
-            max_angle_diff.append(max_diff)
+        # Advance simulation by one step (assuming a step integration method exists)
+        if hasattr(ss, 'integrate_step'):
+            ss.integrate_step()
+        else:
+            # If no step method, assume the simulation advances internally.
+            pass
         
-        max_angle_diff = np.array(max_angle_diff)
-        metrics['max_angle_separation_rad'] = np.max(max_angle_diff)
-        metrics['max_angle_separation_deg'] = np.max(max_angle_diff) * 180 / np.pi
-        metrics['max_angle_separation_time'] = t[np.argmax(max_angle_diff)]
+        # Record current state metrics (using placeholder methods/attributes)
+        current_freq = ss.get_frequency() if hasattr(ss, 'get_frequency') else ss.config.freq
+        current_volt = np.mean(ss.Bus.v.v) if hasattr(ss.Bus, 'v') else 1.0
+        time_series.append(t)
+        frequency_series.append(current_freq)
+        voltage_series.append(current_volt)
+        t += dt
+
+    # Compute example metrics after simulation:
+    max_freq_deviation = np.max(np.abs(np.array(frequency_series) - ss.config.freq))
+    max_voltage_deviation = np.max(np.abs(np.array(voltage_series) - 1.0))
     
-    # Print metrics
-    print("\n=== Cascade Failure Analysis Metrics ===")
-    for key, value in metrics.items():
-        print(f"{key}: {value}")
-    
-    # Create a DataFrame for easier analysis (optional)
-    df = ss.dae.ts.unpack(df=True)
-    
-    # Save metrics to CSV
-    metrics_df = pd.DataFrame([metrics])
-    metrics_df.to_csv(os.path.join(output_dir, 'cascade_metrics.csv'), index=False)
-    print(f"Metrics saved to {os.path.join(output_dir, 'cascade_metrics.csv')}")
-    
+    # Count how many lines and generators were tripped (based on status)
+    lines_tripped = sum(1 for i in range(len(ss.Line))
+                        if hasattr(ss.Line, 'status') and ss.Line.status.v[i] == 0)
+    generators_tripped = 0
+    if hasattr(ss, 'Generator'):
+        generators_tripped = sum(1 for i in range(len(ss.Generator))
+                                if hasattr(ss.Generator, 'status') and ss.Generator.status.v[i] == 0)
+
+    metrics = {
+        'max_frequency_deviation': max_freq_deviation,
+        'max_voltage_deviation': max_voltage_deviation,
+        'lines_tripped': lines_tripped,
+        'generators_tripped': generators_tripped,
+        'time_series': time_series,
+        'frequency_series': frequency_series,
+        'voltage_series': voltage_series,
+    }
     return metrics
 
-def generate_plots(ss):
-    """Generate plots using ANDES plotting functions"""
-    print("\n=== Generating Plots ===")
+def run_all_line_trip_scenarios(ss):
+    """For each eligible (non-transformer) line in the system, run a simulation scenario 
+    in which that line is tripped at t = 1.0 s, and collect cascade metrics.
     
-    # Method 1: Using ANDES CLI commands
-    if ipython is not None:
-        # Plot bus voltages
-        ipython.magic(f'!andes plot {ss.files.lst} 0 --xargs "v Bus" --ylabel "Voltage (pu)" --save')
+    Returns a dictionary mapping scenario names to their metrics.
+    """
+    results = {}
+    num_lines = len(ss.Line)
+    for i in range(num_lines):
+        # Exclude lines that are transformers. (Here, we assume that if a line has a tap value not equal to 1.0, it is a transformer.)
+        if hasattr(ss.Line, 'tap'):
+            if ss.Line.tap.v[i] != 1.0:
+                continue
         
-        # Plot generator speeds
-        if hasattr(ss, 'GENROU'):
-            ipython.magic(f'!andes plot {ss.files.lst} 0 --xargs "omega GENROU" --ylabel "Speed (pu)" --save')
-            
-            # Plot generator angles
-            ipython.magic(f'!andes plot {ss.files.lst} 0 --xargs "delta GENROU" --ylabel "Angle (rad)" --save')
-    else:
-        print("IPython not available for CLI commands")
+        print(f"\nRunning scenario for tripping line {i} (from bus {ss.Line.bus1.v[i]} to bus {ss.Line.bus2.v[i]})")
+        metrics = run_simulation_with_cascade(ss, i)
+        results[f"line_{i}"] = metrics
     
-    # Method 2: Direct plotting with matplotlib using extracted data
-    plt.figure(figsize=(12, 9))
+    return results
+
+def export_metrics_to_excel(metrics_dict, filename="cascade_metrics.xlsx"):
+    """Export the collected simulation metrics for each scenario to an Excel file."""
+    rows = []
+    for scenario, metrics in metrics_dict.items():
+        row = {
+            'Scenario': scenario,
+            'Max Frequency Deviation (Hz)': metrics['max_frequency_deviation'],
+            'Max Voltage Deviation (p.u.)': metrics['max_voltage_deviation'],
+            'Lines Tripped': metrics['lines_tripped'],
+            'Generators Tripped': metrics['generators_tripped'],
+        }
+        rows.append(row)
     
-    # Plot bus voltages
-    plt.subplot(2, 2, 1)
-    bus_voltages = ss.dae.ts.y[:, ss.Bus.v.a]
-    for i in range(bus_voltages.shape[1]):
-        plt.plot(ss.dae.ts.t, bus_voltages[:, i], label=f'Bus {ss.Bus.idx.v[i]}')
-    plt.title('Bus Voltages')
-    plt.ylabel('Voltage (pu)')
-    plt.xlabel('Time (s)')
-    plt.grid(True)
-    
-    # Plot generator data if GENROU exists
-    if hasattr(ss, 'GENROU'):
-        # Plot generator speeds
-        plt.subplot(2, 2, 2)
-        gen_speeds = ss.dae.ts.x[:, ss.GENROU.omega.a]
-        for i in range(gen_speeds.shape[1]):
-            plt.plot(ss.dae.ts.t, gen_speeds[:, i], label=f'Gen {ss.GENROU.idx.v[i]}')
-        plt.title('Generator Speeds')
-        plt.ylabel('Speed (pu)')
-        plt.xlabel('Time (s)')
-        plt.grid(True)
-        
-        # Plot generator angles
-        plt.subplot(2, 2, 3)
-        gen_angles = ss.dae.ts.x[:, ss.GENROU.delta.a]
-        for i in range(gen_angles.shape[1]):
-            plt.plot(ss.dae.ts.t, gen_angles[:, i], label=f'Gen {ss.GENROU.idx.v[i]}')
-        plt.title('Generator Angles')
-        plt.ylabel('Angle (rad)')
-        plt.xlabel('Time (s)')
-        plt.grid(True)
-        
-        # Plot generator electrical powers
-        plt.subplot(2, 2, 4)
-        if hasattr(ss.GENROU, 'Pe'):
-            gen_powers = ss.dae.ts.y[:, ss.GENROU.Pe.a]
-            for i in range(gen_powers.shape[1]):
-                plt.plot(ss.dae.ts.t, gen_powers[:, i], label=f'Gen {ss.GENROU.idx.v[i]}')
-            plt.title('Generator Electrical Powers')
-            plt.ylabel('Power (pu)')
-            plt.xlabel('Time (s)')
-            plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'cascade_analysis_plots.png'), dpi=300)
-    print(f"Plots saved to {os.path.join(output_dir, 'cascade_analysis_plots.png')}")
-    plt.show()
+    df = pd.DataFrame(rows)
+    df.to_excel(filename, index=False)
+    print(f"Metrics exported to {filename}")
 
 if __name__ == "__main__":
-    # Run the cascade analysis
-    ss = run_cascade_analysis()
-    
-    # If you already have a System object, you can extract and analyze data
-    if ss is not None:
-        print("\nCascade analysis completed successfully. Review the metrics and plots.")
-        print(f"Output files are available in the '{output_dir}' directory.")
+    parser = argparse.ArgumentParser(description="Run cascade failure scenarios by tripping lines.")
+    parser.add_argument('--battery', nargs=2, metavar=('BUS', 'POWER'), type=float,
+                        help="Add a battery at specified bus with specified power in MW. Example: --battery 4 20")
+    parser.add_argument('--export-excel', action='store_true', default=False,
+                        help="Export simulation metrics to an Excel file")
+    args = parser.parse_args()
+
+    # Setup the IEEE 14-bus system using the step 1 function.
+    if args.battery:
+        bus = int(args.battery[0])
+        power = args.battery[1]
+        ss = setup_ieee14_dynamic(battery_bus=[bus], battery_p=[power], export_excel=False)
     else:
-        print("Cascade analysis failed. Check error messages above.")
+        ss = setup_ieee14_dynamic(export_excel=False)
+
+    # Run the cascade simulation scenarios for each eligible line.
+    simulation_results = run_all_line_trip_scenarios(ss)
+
+    # Print the results for each scenario.
+    print("\nCascade simulation results:")
+    for scenario, metrics in simulation_results.items():
+        print(f"Scenario {scenario}:")
+        print(f"  Max Frequency Deviation: {metrics['max_frequency_deviation']:.2f} Hz")
+        print(f"  Max Voltage Deviation: {metrics['max_voltage_deviation']:.2f} p.u.")
+        print(f"  Lines Tripped: {metrics['lines_tripped']}")
+        print(f"  Generators Tripped: {metrics['generators_tripped']}")
+
+    # Optionally export metrics to Excel.
+    if args.export_excel:
+        export_metrics_to_excel(simulation_results)

@@ -1,14 +1,13 @@
 import andes
 import numpy as np
 import pandas as pd
-from andes.utils.paths import get_case
 import os
 import shutil
 import argparse
 
 # Define file paths at module level
-RAW_FILE = get_case('ieee14/ieee14.raw')
-DYR_FILE = get_case('ieee14/ieee14.dyr')
+RAW_FILE = os.path.join('data', 'ieee14', 'ieee14.raw')
+DYR_FILE = os.path.join('data', 'ieee14', 'ieee14.dyr')
 
 def export_system_data_to_excel(ss, filename='system_data.xlsx'):
     """Export power system data to Excel file with all tables in a single sheet"""
@@ -196,7 +195,7 @@ def setup_ieee14_dynamic(setup=True, export_excel=False, battery_bus=None, batte
     # Set correct voltage bases
     for i in range(len(ss.Bus)):
         bus_idx = ss.Bus.idx.v[i]
-        if bus_idx in [1, 2, 3, 4, 5, 8]:
+        if bus_idx in [1, 2, 3, 4, 5]:
             ss.Bus.Vn.v[i] = 138.0  # 138 kV base for buses 1-5 and 8
         else:
             ss.Bus.Vn.v[i] = 69.0   # 69 kV base for the rest
